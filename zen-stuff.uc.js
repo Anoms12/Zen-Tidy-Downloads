@@ -1,0 +1,2311 @@
+// ==UserScript==
+// @include   main
+// @loadOrder 99999999999998
+// @ignorecache
+// ==/UserScript==
+
+// zen-dismissed-downloads-pile.uc.js
+// Dismissed downloads pile with messy-to-grid transition
+(function () {
+  "use strict";
+
+  // Wait for browser window to be ready
+  if (location.href !== "chrome://browser/content/browser.xhtml") return;
+
+  // Configuration
+  const CONFIG = {
+    maxPileSize: 20, // Maximum pods to keep in pile
+    pileDisplayCount: 4, // Pods visible in messy pile
+    gridAnimationDelay: 50, // ms between pod animations
+    hoverDebounceMs: 150, // Hover debounce delay
+    pileRotationRange: 8, // degrees ±
+    pileOffsetRange: 8, // pixels ±
+    gridPadding: 12, // pixels between grid items
+    minPodSize: 45, // minimum pod size in grid
+    animationDuration: 400, // pod transition duration
+    containerAnimationDuration: 100, // container height/padding transition duration
+  };
+
+  // Firefox preferences
+  const PREFS = {
+    alwaysShowPile: 'zen.stuff-pile.always-show', // Boolean: show pile always (hide with Alt key)
+  };
+
+  // State management
+  let downloadButton = null;
+  let pileContainer = null;
+  let dynamicSizer = null; // <-- Add new state for the sizer
+  let isGridMode = false;
+  let hoverTimeout = null;
+  let dismissedPods = new Map(); // Local copy with layout data
+  let isInitialized = false;
+
+  // Hover event management flags
+  let containerHoverEventsAttached = false;
+  let pileHoverEventsAttached = false;
+  let isTransitioning = false; // Add transition flag to prevent hide during mode switches
+
+  // Alt key state for always-show mode
+  let isAltPressed = false;
+
+  // Animation state tracking
+  const podElements = new Map(); // podKey -> DOM element
+  const pilePositions = new Map(); // podKey -> {x, y, rotation, zIndex}
+  const gridPositions = new Map(); // podKey -> {x, y, row, col}
+
+  let currentZenSidebarWidthForPile = ''; // For pile's own width sync
+
+  // Debug logging
+  function debugLog(message, data = null) {
+    try {
+      console.log(`[Dismissed Pile] ${message}`, data || '');
+    } catch (e) {
+      console.log(`[Dismissed Pile] ${message}`);
+    }
+  }
+
+  // Initialize the pile system
+  async function init() {
+    debugLog("Initializing dismissed downloads pile system");
+    
+    // Wait for the main download script to be available
+    if (!window.zenTidyDownloads) {
+      debugLog("Main download script not ready, retrying in 500ms");
+      setTimeout(init, 500);
+      return;
+    }
+
+    try {
+      await findDownloadButton();
+      await createPileContainer(); // This now creates dynamicSizer too
+      setupEventListeners();
+      loadExistingDismissedPods();
+      
+      isInitialized = true;
+      debugLog("Dismissed downloads pile system initialized successfully");
+    } catch (error) {
+      debugLog("Error initializing pile system:", error);
+      setTimeout(init, 1000); // Retry on error
+    }
+  }
+
+  // Find the Firefox downloads button
+  async function findDownloadButton() {
+    const selectors = [
+      '#downloads-button',
+      '[data-l10n-id="downloads-button"]',
+      '#downloads-indicator',
+      '.toolbarbutton-1[command="Tools:Downloads"]'
+    ];
+
+    for (const selector of selectors) {
+      downloadButton = document.querySelector(selector);
+      if (downloadButton) {
+        debugLog(`Found download button using selector: ${selector}`);
+        return;
+      }
+    }
+
+    // Fallback: look for any element with downloads-related attributes
+    const fallbackElements = document.querySelectorAll('[id*="download"], [class*="download"]');
+    for (const element of fallbackElements) {
+      if (element.getAttribute('command')?.includes('Downloads') || 
+          element.textContent?.toLowerCase().includes('download')) {
+        downloadButton = element;
+        debugLog("Found download button using fallback method", element);
+        return;
+      }
+    }
+
+    throw new Error("Download button not found");
+  }
+
+  // Create the pile container
+  async function createPileContainer() {
+    if (!downloadButton) throw new Error("Download button not available");
+
+    // Create the dynamic sizer element
+    dynamicSizer = document.createElement("div");
+    dynamicSizer.id = "zen-dismissed-pile-dynamic-sizer";
+    dynamicSizer.style.cssText = `
+      position: fixed;
+      overflow: hidden;
+      height: 0px;
+      bottom: 30px;
+      left: 0px;
+      background: transparent;
+      mask: linear-gradient(to top, transparent 0%, black 5%, black 80%, transparent 100%);
+      -webkit-mask: linear-gradient(to top, transparent 0%, black 5%, black 85%, transparent 100%);
+      box-sizing: border-box;
+      transition: height ${CONFIG.containerAnimationDuration}ms ease, padding-bottom ${CONFIG.containerAnimationDuration}ms ease, padding-left ${CONFIG.containerAnimationDuration}ms ease, background 0.2s ease;
+      display: flex;
+      align-items: flex-end;
+      justify-content: flex-start;
+      padding-bottom: 0px;
+      padding-left: 0px;
+      z-index: 4;
+      /* Width will be set by sync logic */
+    `;
+
+    pileContainer = document.createElement("div");
+    pileContainer.id = "zen-dismissed-pile-container";
+    pileContainer.className = "zen-dismissed-pile";
+    
+    // Adjusted styles for pileContainer (now relative within sizer)
+    pileContainer.style.cssText = `
+      position: relative; /* Changed from fixed */
+      z-index: 1; /* Lower z-index as it's contained */
+      /* top, left, bottom, right removed */
+      /* opacity, display, and their transitions removed - parent handles visibility */
+      /* pointer-events will be set on dynamicSizer when shown */
+    `;
+
+    // Create floating downloads button
+    const downloadsButton = document.createElement("button");
+    downloadsButton.id = "zen-pile-downloads-button";
+    downloadsButton.innerHTML = "Full list";
+    downloadsButton.title = "Open Firefox Downloads";
+    downloadsButton.style.cssText = `
+      width: 50px;
+      height: 20px;
+      border: none;
+      border-radius: 4px;
+      background: var(--zen-primary-color);
+      color: light-dark(rgb(255,255,255), rgb(0,0,0));
+      font-size: 10px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s ease, opacity 0.2s ease;
+      opacity: 0;
+    `;
+
+    // Add hover effect
+    downloadsButton.addEventListener('mouseenter', () => {
+      downloadsButton.style.background = 'color-mix(in srgb, var(--zen-primary-color) 80%, transparent)';
+    });
+    downloadsButton.addEventListener('mouseleave', () => {
+      downloadsButton.style.background = 'var(--zen-primary-color)';
+    });
+
+    // Add click handler to open downloads
+    downloadsButton.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      try {
+        // Try to open the downloads panel
+        if (window.DownloadsPanel) {
+          window.DownloadsPanel.showDownloadsHistory();
+        } else if (window.PlacesCommandHook) {
+          window.PlacesCommandHook.showPlacesOrganizer('Downloads');
+        } else {
+          // Fallback: open downloads page
+          window.openTrustedLinkIn('about:downloads', 'tab');
+        }
+        debugLog("Opened Firefox downloads");
+      } catch (error) {
+        debugLog("Error opening downloads:", error);
+      }
+    });
+
+    // Create clear all downloads button
+    const clearAllButton = document.createElement("button");
+    clearAllButton.id = "zen-pile-clear-all-button";
+    clearAllButton.innerHTML = "Clear all";
+    clearAllButton.title = "Clear all Firefox Downloads";
+    clearAllButton.style.cssText = `
+      width: 50px;
+      height: 20px;
+      border: none;
+      border-radius: 4px;
+      background: light-dark(rgba(220, 53, 69, 1), rgb(223, 90, 104));
+      color: white;
+      font-size: 10px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s ease, opacity 0.2s ease;
+      opacity: 0;
+    `;
+
+    // Add hover effect for clear button
+    clearAllButton.addEventListener('mouseenter', () => {
+      clearAllButton.style.background = 'light-dark(rgb(223, 90, 104), rgba(220, 53, 69, 1))';
+    });
+    clearAllButton.addEventListener('mouseleave', () => {
+      clearAllButton.style.background = 'light-dark(rgba(220, 53, 69, 1), rgb(223, 90, 104))';
+    });
+
+    // Add click handler to clear all downloads
+    clearAllButton.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      try {
+        // Confirm with user before clearing
+        if (confirm("Clear all downloads from Firefox history? This action cannot be undone.")) {
+          await clearAllDownloads();
+          debugLog("Cleared all Firefox downloads");
+        }
+      } catch (error) {
+        debugLog("Error clearing downloads:", error);
+      }
+    });
+
+    // Create button container for centering
+    const buttonContainer = document.createElement("div");
+    buttonContainer.id = "zen-pile-button-container";
+    buttonContainer.style.cssText = `
+      position: absolute;
+      top: 5px;
+      left: 0;
+      right: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 5px;
+      z-index: 10;
+      margin-top: 30px;
+      pointer-events: none;
+    `;
+
+    // Enable pointer events for buttons but not container
+    downloadsButton.style.pointerEvents = 'auto';
+    clearAllButton.style.pointerEvents = 'auto';
+
+    // Add buttons to container
+    buttonContainer.appendChild(downloadsButton);
+    buttonContainer.appendChild(clearAllButton);
+
+    // Append button container to dynamicSizer (not individual buttons)
+    dynamicSizer.appendChild(buttonContainer);
+
+    // Append pileContainer to dynamicSizer
+    dynamicSizer.appendChild(pileContainer);
+
+    // Setup hover events for background/buttons now that everything is created
+    setupPileBackgroundHoverEvents();
+
+    // Always append to document.body for maximum z-index control
+    document.body.appendChild(dynamicSizer);
+    debugLog("Created pile container and dynamic sizer, appended to document.body");
+  }
+
+  // Setup event listeners
+  function setupEventListeners() {
+    // Listen for pod dismissals from main script
+    window.zenTidyDownloads.onPodDismissed((podData) => {
+      debugLog("Received pod dismissal:", podData);
+      addPodToPile(podData);
+    });
+
+    // Download button hover events
+    if (downloadButton) {
+      downloadButton.addEventListener('mouseenter', handleDownloadButtonHover);
+      downloadButton.addEventListener('mouseleave', handleDownloadButtonLeave);
+    }
+
+    // Also listen for hover on the main download cards container area
+    const mainDownloadContainer = document.getElementById('userchrome-download-cards-container');
+    if (mainDownloadContainer) {
+      mainDownloadContainer.addEventListener('mouseenter', handleDownloadButtonHover);
+      mainDownloadContainer.addEventListener('mouseleave', handleDownloadButtonLeave);
+      debugLog("Added hover listeners to main download cards container");
+    }
+
+    // Dynamic sizer hover events (keep container open when cursor is inside)
+    if (dynamicSizer) {
+      dynamicSizer.addEventListener('mouseenter', handleDynamicSizerHover);
+      dynamicSizer.addEventListener('mouseleave', handleDynamicSizerLeave);
+      debugLog("Added hover listeners to dynamic sizer");
+    }
+
+    // Pile container hover events
+    pileContainer.addEventListener('mouseenter', handlePileHover);
+    pileContainer.addEventListener('mouseleave', handlePileLeave);
+
+    // Alt key listeners for always-show mode
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keyup', handleKeyUp);
+
+    // Preference change listener
+    setupPreferenceListener();
+
+    // Window resize handler
+    window.addEventListener('resize', debounce(recalculateLayout, 250));
+
+    // Listen for actual download removals from Firefox list (via main script)
+    if (window.zenTidyDownloads && typeof window.zenTidyDownloads.onActualDownloadRemoved === 'function') {
+      window.zenTidyDownloads.onActualDownloadRemoved((removedKey) => {
+        debugLog(`[PileSync] Received actual download removal notification for key: ${removedKey}`);
+        if (dismissedPods.has(removedKey)) {
+          removePodFromPile(removedKey);
+          debugLog(`[PileSync] Removed pod ${removedKey} from pile as it was cleared from Firefox list.`);
+        }
+      });
+      debugLog("[PileSync] Registered listener for actual download removals.");
+    } else {
+      debugLog("[PileSync] Could not register listener for actual download removals - API not found on main script.");
+    }
+
+    // Context menu click-outside handler
+    document.addEventListener('click', (e) => {
+      if (window.zenPileContextMenu && 
+          !window.zenPileContextMenu.contextMenu.contains(e.target)) {
+        hideContextMenu();
+      }
+    });
+
+    debugLog("Event listeners setup complete");
+  }
+
+  // Load any existing dismissed pods from main script
+  function loadExistingDismissedPods() {
+    const existingPods = window.zenTidyDownloads.dismissedPods.getAll();
+    existingPods.forEach((podData, key) => {
+      addPodToPile(podData, false); // Don't animate existing pods
+    });
+    debugLog(`Loaded ${existingPods.size} existing dismissed pods`);
+    
+    // If always-show mode is enabled and we have pods, show the pile
+    if (getAlwaysShowPile() && existingPods.size > 0) {
+      setTimeout(() => {
+        if (shouldPileBeVisible()) {
+          showPile();
+          debugLog("[AlwaysShow] Showing pile on startup - always-show mode enabled");
+        }
+      }, 100); // Small delay to ensure DOM is ready
+    }
+  }
+
+  // Add a pod to the pile
+  function addPodToPile(podData, animate = true) {
+    if (!podData || !podData.key) {
+      debugLog("Invalid pod data for pile addition");
+      return;
+    }
+
+    // Limit pile size
+    if (dismissedPods.size >= CONFIG.maxPileSize) {
+      const oldestKey = Array.from(dismissedPods.keys())[0];
+      removePodFromPile(oldestKey);
+    }
+
+    // Store pod data
+    dismissedPods.set(podData.key, podData);
+
+    // Create DOM element
+    const podElement = createPodElement(podData);
+    podElements.set(podData.key, podElement);
+    pileContainer.appendChild(podElement);
+
+    // Generate pile position
+    generatePilePosition(podData.key);
+
+    // Generate grid position
+    generateGridPosition(podData.key);
+
+    // Apply initial pile position
+    applyPilePosition(podData.key, animate);
+
+    // Update pile visibility
+    updatePileVisibility();
+
+    // Update downloads button visibility
+    updateDownloadsButtonVisibility();
+
+    // In always-show mode, show the pile immediately when a pod is added
+    if (getAlwaysShowPile() && shouldPileBeVisible()) {
+      showPile();
+    }
+
+    debugLog(`Added pod to pile: ${podData.filename}`);
+  }
+
+  // Create a DOM element for a dismissed pod
+  function createPodElement(podData) {
+    const pod = document.createElement("div");
+    pod.className = "dismissed-pod";
+    pod.dataset.podKey = podData.key;
+    pod.title = `${podData.filename}\nClick: Open file\nMiddle-click: Show in file explorer\nRight-click: Context menu`;
+    
+    pod.style.cssText = `
+      position: absolute;
+      width: 45px;
+      height: 45px;
+      border-radius: 8px;
+      overflow: hidden;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      transition: transform ${CONFIG.animationDuration}ms cubic-bezier(0.4, 0, 0.2, 1);
+      will-change: transform;
+    `;
+
+    // Create preview content
+    const preview = document.createElement("div");
+    preview.className = "dismissed-pod-preview";
+    preview.style.cssText = `
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #2a2a2a;
+      color: white;
+      font-size: 20px;
+    `;
+
+    // Set preview content
+    if (podData.previewData) {
+      if (podData.previewData.type === 'image' && podData.previewData.src) {
+        const img = document.createElement("img");
+        img.src = podData.previewData.src;
+        img.style.cssText = `
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        `;
+        img.onerror = () => {
+          preview.innerHTML = getFileIcon(podData.contentType);
+        };
+        preview.appendChild(img);
+      } else if (podData.previewData.html) {
+        preview.innerHTML = podData.previewData.html;
+      } else {
+        preview.innerHTML = getFileIcon(podData.contentType);
+      }
+    } else {
+      preview.innerHTML = getFileIcon(podData.contentType);
+    }
+
+    pod.appendChild(preview);
+
+    // Add click handler for opening in file explorer
+    pod.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      debugLog(`Attempting to open file: ${podData.key}`);
+      openPodFile(podData);
+    });
+
+    // Add middle-click handler for showing in file explorer
+    pod.addEventListener('mousedown', (e) => {
+      if (e.button === 1) { // Middle mouse button
+        e.preventDefault();
+        e.stopPropagation();
+        debugLog(`Attempting to show file in explorer: ${podData.key}`);
+        showPodFileInExplorer(podData);
+      }
+    });
+
+    // Add right-click handler - different behavior based on mode
+    pod.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      
+      if (isGridMode) {
+        // Grid mode: show context menu
+        debugLog(`[ContextMenu] Right-click in grid mode on: ${podData.filename}`);
+        showContextMenu(e.clientX, e.clientY, podData);
+      } else {
+        // Pile mode: simple confirm dialog (existing behavior)
+        debugLog(`[PileMode] Right-click in pile mode on: ${podData.filename}`);
+        if (confirm(`Permanently delete "${podData.filename}" from pile?`)) {
+          window.zenTidyDownloads.permanentDelete(podData.key);
+          removePodFromPile(podData.key);
+          debugLog(`Permanently deleted pod: ${podData.filename}`);
+        }
+      }
+    });
+
+    return pod;
+  }
+
+  // Get file icon based on content type
+  function getFileIcon(contentType) {
+    if (!contentType) return "📄";
+    
+    if (contentType.includes("image/")) return "🖼️";
+    if (contentType.includes("video/")) return "🎬";
+    if (contentType.includes("audio/")) return "🎵";
+    if (contentType.includes("text/")) return "📝";
+    if (contentType.includes("application/pdf")) return "📕";
+    if (contentType.includes("application/zip") || contentType.includes("application/x-rar")) return "🗜️";
+    if (contentType.includes("application/")) return "📦";
+    
+    return "📄";
+  }
+
+  // Generate random pile position for a pod
+  function generatePilePosition(podKey) {
+    const angle = (Math.random() - 0.5) * CONFIG.pileRotationRange * 2;
+    const offsetX = (Math.random() - 0.5) * CONFIG.pileOffsetRange * 2;
+    const offsetY = (Math.random() - 0.5) * CONFIG.pileOffsetRange * 2;
+    
+    // Newer pods should have higher z-index to appear on top
+    // Get the order of this pod in the dismissedPods map (newer = higher index)
+    const pods = Array.from(dismissedPods.keys());
+    const podIndex = pods.indexOf(podKey);
+    const zIndex = podIndex + 1; // Start from 1, newer pods get higher z-index
+
+    pilePositions.set(podKey, {
+      x: offsetX,
+      y: offsetY,
+      rotation: angle,
+      zIndex: zIndex
+    });
+    
+    debugLog(`Generated pile position for ${podKey}:`, {
+      index: podIndex,
+      zIndex,
+      angle,
+      offsetX,
+      offsetY
+    });
+  }
+
+  // Generate grid position for a pod
+  function generateGridPosition(podKey) {
+    const pods = Array.from(dismissedPods.keys());
+    const index = pods.indexOf(podKey);
+    if (index === -1) return;
+
+    // 2x3 grid: 2 rows, 3 columns
+    // First pod (index 0) stays at (0,0) - becomes the anchor
+    // Other pods position relative to the first pod
+    const cols = 3;
+    const maxRows = 2;
+    
+    const col = index % cols; // Column: 0, 1, 2, 0, 1, 2, ...
+    const logicalRow = Math.floor(index / cols); // Which row logically: 0, 0, 0, 1, 1, 1, ...
+    const visualRow = logicalRow % maxRows; // 0 = bottom row, 1 = top row
+    
+    const podSize = CONFIG.minPodSize;
+    const spacing = CONFIG.gridPadding;
+    
+    // First pod stays at origin (0,0) - this is our anchor
+    // Other pods position relative to it
+    let x, y;
+    
+    if (index === 0) {
+      // First pod stays at pile position
+      x = 0;
+      y = 0;
+    } else {
+      // Other pods arrange in grid pattern relative to first pod
+      x = col * (podSize + spacing);
+      y = -visualRow * (podSize + spacing); // Negative Y grows upward
+    }
+
+    gridPositions.set(podKey, { x, y, row: logicalRow, col });
+    
+    debugLog(`Anchor-based Grid position for ${podKey}:`, {
+      index,
+      col,
+      logicalRow,
+      visualRow,
+      x,
+      y,
+      isAnchor: index === 0,
+      description: visualRow === 0 ? 'bottom row' : 'top row'
+    });
+  }
+
+  // Apply pile position to a pod
+  function applyPilePosition(podKey, animate = true) {
+    const podElement = podElements.get(podKey);
+    const position = pilePositions.get(podKey);
+    if (!podElement || !position) return;
+
+    const transform = `translate3d(${position.x}px, ${position.y}px, 0) rotate(${position.rotation}deg)`;
+    
+    if (!animate) {
+      podElement.style.transition = 'none';
+    }
+    
+    podElement.style.transform = transform;
+    podElement.style.zIndex = position.zIndex;
+    
+    if (!animate) {
+      // Re-enable transitions after position is set
+      requestAnimationFrame(() => {
+        podElement.style.transition = `transform ${CONFIG.animationDuration}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+      });
+    }
+  }
+
+  // Apply grid position to a pod
+  function applyGridPosition(podKey, delay = 0) {
+    const podElement = podElements.get(podKey);
+    const position = gridPositions.get(podKey);
+    if (!podElement || !position) return;
+
+    setTimeout(() => {
+      const transform = `translate3d(${position.x}px, ${position.y}px, 0) rotate(0deg)`;
+      podElement.style.transform = transform;
+      // z-index is now set before animation starts in transitionToGrid()
+    }, delay);
+  }
+
+  // Remove a pod from the pile
+  function removePodFromPile(podKey) {
+    const podElement = podElements.get(podKey);
+    if (podElement) {
+      podElement.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+      podElement.style.opacity = '0';
+      podElement.style.transform += ' scale(0.8)';
+      
+      setTimeout(() => {
+        if (podElement.parentNode) {
+          podElement.parentNode.removeChild(podElement);
+        }
+      }, 300);
+    }
+
+    dismissedPods.delete(podKey);
+    podElements.delete(podKey);
+    pilePositions.delete(podKey);
+    gridPositions.delete(podKey);
+
+    // Recalculate grid positions for remaining pods
+    dismissedPods.forEach((_, key) => generateGridPosition(key));
+    
+    // updatePileVisibility will handle sizer height if needed
+    updatePileVisibility(); // This will now call showPile/hidePile which adjust sizer
+
+    // Update downloads button visibility
+    updateDownloadsButtonVisibility();
+  }
+
+  // Update pile visibility based on pod count
+  function updatePileVisibility() {
+    if (dismissedPods.size === 0) {
+      // If pile becomes empty, hide it (will set sizer height to 0)
+      if (dynamicSizer.style.height !== '0px') { // only if not already hidden
+          hidePile(); 
+      }
+    } else {
+      // If pile has items, ensure it's "shown" (height will be set)
+      // showPile() will be called on hover, this just ensures initial state if pods loaded
+      // updatePilePosition(); // This function will be revised/removed
+      
+      // If pile is currently visible, recalculate height dynamically
+      if (dynamicSizer && dynamicSizer.style.height !== '0px') {
+        updatePileHeight();
+      }
+      
+      // Show only the top few pods in pile mode
+      let visibleCount = 0;
+      const sortedPods = Array.from(dismissedPods.keys()).reverse(); // Newest first
+      
+      sortedPods.forEach(podKey => {
+        const podElement = podElements.get(podKey);
+        if (!podElement) return;
+        
+        if (visibleCount < CONFIG.pileDisplayCount) {
+          podElement.style.display = 'block';
+          visibleCount++;
+        } else if (!isGridMode) {
+          podElement.style.display = 'none';
+        } else {
+          podElement.style.display = 'block'; // Show all in grid mode
+        }
+      });
+      // If it's not already visible (e.g. initial load with pods), and it's supposed to be hovered to show,
+      // this function shouldn't force it open. showPile handles that.
+      // However, if it *is* already open (sizer height > 0) and a pod is added/removed,
+      // we might need to re-evaluate the sizer height if it's dynamic.
+      // For now, showPile/hidePile will manage sizer height.
+    }
+  }
+
+  // Update pile height dynamically based on current pod count
+  function updatePileHeight() {
+    if (!dynamicSizer || dismissedPods.size === 0) return;
+    
+    const cols = 3;
+    const podSize = CONFIG.minPodSize;
+    const spacing = CONFIG.gridPadding;
+    
+    // Calculate dynamic height based on number of rows needed
+    const totalPods = dismissedPods.size;
+    const maxPodsToShow = 6; // Show last 6 pods in grid
+    const podsToShow = Math.min(totalPods, maxPodsToShow);
+    const rowsNeeded = Math.ceil(podsToShow / cols); // How many rows we actually need
+    const maxRows = 2; // Maximum rows we support
+    const actualRows = Math.min(rowsNeeded, maxRows);
+    
+    // Calculate height: base height + (rows * pod size) + spacing between rows + extra padding
+    const baseHeight = 80; // Base padding
+    const rowHeight = podSize + spacing;
+    const gridHeight = baseHeight + (actualRows * rowHeight);
+    
+    debugLog("Updating pile height dynamically", {
+      totalPods,
+      podsToShow,
+      rowsNeeded,
+      actualRows,
+      oldHeight: dynamicSizer.style.height,
+      newHeight: `${gridHeight}px`
+    });
+    
+    dynamicSizer.style.height = `${gridHeight}px`;
+  }
+
+  // Update pile position relative to download button
+  function updatePilePosition() {
+    // This function is largely obsolete as the pile is now in-flow within dynamicSizer.
+    // Width will be handled by updatePileContainerWidth.
+    // Height will be handled by showPile/hidePile.
+    debugLog("updatePilePosition called, but largely obsolete now.");
+    // If dynamicSizer exists and we need to ensure its width is up-to-date:
+    if (typeof updatePileContainerWidth === 'function') {
+        // updatePileContainerWidth(); // Call this if needed, but it's called on showPile
+    }
+  }
+
+  // Download button hover handler
+  function handleDownloadButtonHover() {
+    debugLog("[DownloadHover] handleDownloadButtonHover called", {
+      dismissedPodsSize: dismissedPods.size,
+      shouldDisableHover: shouldDisableHover(),
+      alwaysShowMode: getAlwaysShowPile()
+    });
+    
+    if (dismissedPods.size === 0) return;
+    
+    // In always-show mode, don't handle hover events
+    if (getAlwaysShowPile()) {
+      debugLog("[DownloadHover] Always-show mode enabled - ignoring hover");
+      return;
+    }
+    
+    // Check if main download script has active pods and disable hover if so
+    if (shouldDisableHover()) {
+      debugLog("[HoverDisabled] Pile hover disabled - main download script has active pods");
+      return;
+    }
+
+    clearTimeout(hoverTimeout);
+    hoverTimeout = setTimeout(() => {
+      debugLog("[DownloadHover] Timeout triggered - calling showPile()");
+      showPile();
+    }, CONFIG.hoverDebounceMs);
+  }
+
+  // Download button leave handler
+  function handleDownloadButtonLeave() {
+    debugLog("[DownloadHover] handleDownloadButtonLeave called");
+    
+    // In always-show mode, don't handle hover events
+    if (getAlwaysShowPile()) {
+      debugLog("[DownloadHover] Always-show mode enabled - ignoring leave");
+      return;
+    }
+    
+    if (shouldDisableHover()) {
+      return; // Don't process leave events if hover is disabled
+    }
+    
+    clearTimeout(hoverTimeout);
+    hoverTimeout = setTimeout(() => {
+      const mainDownloadContainer = document.getElementById('userchrome-download-cards-container');
+      const isHoveringDownloadArea = downloadButton?.matches(':hover') || mainDownloadContainer?.matches(':hover');
+      
+      debugLog("[DownloadHover] Leave timeout - checking hover states", {
+        isHoveringDownloadArea,
+        pileContainerHover: pileContainer.matches(':hover'),
+        dynamicSizerHover: dynamicSizer.matches(':hover')
+      });
+      
+      // Only hide if cursor is not over download area AND not over pile components
+      if (!isHoveringDownloadArea && !pileContainer.matches(':hover') && !dynamicSizer.matches(':hover')) {
+        debugLog("[DownloadHover] Calling hidePile()");
+        hidePile();
+      }
+    }, CONFIG.hoverDebounceMs);
+  }
+
+  // Dynamic sizer hover handler  
+  function handleDynamicSizerHover() {
+    debugLog("[SizerHover] handleDynamicSizerHover called");
+    
+    // In always-show mode, don't handle hover events for showing
+    if (getAlwaysShowPile()) return;
+    
+    clearTimeout(hoverTimeout);
+    if (dismissedPods.size > 0) {
+      showPile(); // Ensure pile stays open when hovering the sizer
+    }
+  }
+
+  // Dynamic sizer leave handler
+  function handleDynamicSizerLeave() {
+    debugLog("[SizerHover] handleDynamicSizerLeave called");
+    
+    clearTimeout(hoverTimeout);
+    
+    // Don't do anything if context menu is visible
+    if (isContextMenuVisible()) {
+      debugLog("[SizerHover] Context menu visible - ignoring leave event");
+      return;
+    }
+    
+    // Always handle grid-to-pile transition when leaving the container
+    // regardless of always-show mode
+    if (isGridMode) {
+      setTimeout(() => {
+        // Double-check we're not hovering over pile or sizer and context menu isn't visible
+        if (!pileContainer.matches(':hover') && !dynamicSizer.matches(':hover') && !isContextMenuVisible()) {
+          debugLog("[SizerHover] Transitioning back to pile mode from grid");
+          transitionToPile();
+        }
+      }, CONFIG.hoverDebounceMs);
+    }
+    
+    // In always-show mode, don't handle pile visibility, just transitions
+    if (getAlwaysShowPile()) {
+      debugLog("[SizerHover] Always-show mode - only handling grid transition");
+      return;
+    }
+    
+    // Normal mode: handle pile hiding
+    hoverTimeout = setTimeout(() => {
+      const mainDownloadContainer = document.getElementById('userchrome-download-cards-container');
+      const isHoveringDownloadArea = downloadButton?.matches(':hover') || mainDownloadContainer?.matches(':hover');
+      
+      debugLog("[SizerHover] Leave timeout - checking hover states", {
+        isHoveringDownloadArea,
+        pileContainerHover: pileContainer.matches(':hover'),
+        contextMenuVisible: isContextMenuVisible()
+      });
+      
+      // Only hide if not hovering download area AND not hovering pile container AND context menu not visible
+      if (!isHoveringDownloadArea && !pileContainer.matches(':hover') && !isContextMenuVisible()) {
+        debugLog("[SizerHover] Calling hidePile()");
+        hidePile();
+      }
+    }, CONFIG.hoverDebounceMs);
+  }
+
+  // Pile hover handler
+  function handlePileHover() {
+    debugLog("[PileHover] handlePileHover called", {
+      isGridMode,
+      alwaysShowMode: getAlwaysShowPile()
+    });
+    
+    clearTimeout(hoverTimeout);
+    
+    // In pile mode, show background immediately when hovering pile (works in both modes)
+    if (!isGridMode) {
+      debugLog("[PileHover] In pile mode - showing background immediately");
+      showPileBackground();
+    }
+    
+    if (!isGridMode) {
+      debugLog("[PileHover] Not in grid mode - transitioning to grid");
+      transitionToGrid();
+    }
+  }
+
+  // Pile leave handler
+  function handlePileLeave() {
+    debugLog("[PileHover] handlePileLeave called", {
+      alwaysShowMode: getAlwaysShowPile(),
+      isGridMode,
+      contextMenuVisible: isContextMenuVisible()
+    });
+    
+    clearTimeout(hoverTimeout);
+    
+    // Don't do anything if context menu is visible
+    if (isContextMenuVisible()) {
+      debugLog("[PileHover] Context menu visible - ignoring leave event");
+      return;
+    }
+    
+    // Always handle grid-to-pile transition when leaving the pile
+    if (isGridMode) {
+      setTimeout(() => {
+        // Only transition back if we're not hovering over the sizer and context menu isn't visible
+        if (!dynamicSizer.matches(':hover') && !isContextMenuVisible()) {
+          debugLog("[PileHover] Transitioning back to pile mode from grid");
+          transitionToPile();
+        }
+      }, CONFIG.hoverDebounceMs);
+    }
+    
+    // In always-show mode, don't hide the pile itself, transitions are handled above
+    if (getAlwaysShowPile()) {
+      debugLog("[PileHover] Always-show mode - only handling grid transition");
+      return;
+    }
+    
+    // Normal mode: handle pile hiding
+    hoverTimeout = setTimeout(() => {
+      const mainDownloadContainer = document.getElementById('userchrome-download-cards-container');
+      const isHoveringDownloadArea = downloadButton?.matches(':hover') || mainDownloadContainer?.matches(':hover');
+      
+      debugLog("[PileHover] Leave timeout - checking hover states", {
+        isHoveringDownloadArea,
+        dynamicSizerHover: dynamicSizer.matches(':hover'),
+        contextMenuVisible: isContextMenuVisible()
+      });
+      
+      // Only hide if not hovering download area AND not hovering dynamic sizer AND context menu not visible
+      if (!isHoveringDownloadArea && !dynamicSizer.matches(':hover') && !isContextMenuVisible()) {
+        debugLog("[PileHover] Calling hidePile()");
+        hidePile();
+      }
+    }, CONFIG.hoverDebounceMs);
+  }
+
+  // Show the pile
+  function showPile() {
+    debugLog("[ShowPile] showPile called", {
+      dismissedPodsSize: dismissedPods.size,
+      currentHeight: dynamicSizer?.style.height,
+      isGridMode,
+      alwaysShowMode: getAlwaysShowPile()
+    });
+    
+    if (dismissedPods.size === 0 || !dynamicSizer) return;
+    
+    // Ensure width is set before calculating positions
+    if (typeof updatePileContainerWidth === 'function') {
+        updatePileContainerWidth();
+    }
+
+    // Calculate exact position based on sidebar location
+    const navigatorToolbox = document.getElementById('navigator-toolbox');
+    if (navigatorToolbox) {
+      const rect = navigatorToolbox.getBoundingClientRect();
+      const isRightSide = document.documentElement.getAttribute('zen-right-side') === 'true';
+      
+      if (isRightSide) {
+        // Position on the right side
+        const containerWidth = parseFloat(currentZenSidebarWidthForPile) || 300;
+        dynamicSizer.style.left = `${rect.right - containerWidth}px`;
+      } else {
+        // Position on the left side
+        dynamicSizer.style.left = `${rect.left}px`;
+      }
+      
+      debugLog("Positioned pile based on sidebar location", {
+        sidebarRect: rect,
+        isRightSide,
+        finalLeft: dynamicSizer.style.left
+      });
+    }
+
+    // Calculate smart left padding so the GRID will be centered when it forms
+    const containerWidth = parseFloat(currentZenSidebarWidthForPile) || 300;
+    const cols = 3;
+    const podSize = CONFIG.minPodSize;
+    const spacing = CONFIG.gridPadding;
+    
+    // Calculate total grid dimensions
+    const gridWidth = (cols * podSize) + ((cols - 1) * spacing);
+    
+    // Calculate where the grid should be positioned to be centered
+    const gridCenterX = containerWidth / 2;
+    const gridLeftEdge = gridCenterX - (gridWidth / 2);
+    
+    // The first pod (index 0) will be at the bottom-left of the grid
+    // So position the pile so the first pod ends up at the grid's left edge
+    // Divide by 4 to correct for excessive padding
+    const smartLeftPadding = Math.max(gridLeftEdge / 4, 10) + 10; // minimum 10px padding + 10px extra
+    
+    // Set pointer-events based on mode and state
+    updatePointerEvents();
+    
+    dynamicSizer.style.paddingBottom = '60px';
+    dynamicSizer.style.paddingLeft = `${smartLeftPadding}px`;
+    
+    // Calculate dynamic height based on number of rows needed
+    const totalPods = dismissedPods.size;
+    const maxPodsToShow = 6; // Show last 6 pods in grid
+    const podsToShow = Math.min(totalPods, maxPodsToShow);
+    const rowsNeeded = Math.ceil(podsToShow / cols); // How many rows we actually need
+    const maxRows = 2; // Maximum rows we support
+    const actualRows = Math.min(rowsNeeded, maxRows);
+    
+    // Calculate height: base height + (rows * pod size) + spacing between rows + extra padding
+    const baseHeight = 80; // Base padding
+    const rowHeight = podSize + spacing;
+    const gridHeight = baseHeight + (actualRows * rowHeight);
+    
+    debugLog("Dynamic height calculation", {
+      totalPods,
+      podsToShow,
+      rowsNeeded,
+      actualRows,
+      podSize,
+      spacing,
+      calculatedHeight: gridHeight
+    });
+    
+    dynamicSizer.style.height = `${gridHeight}px`; 
+    
+    // Ensure hover events are properly set up for the current mode
+    // This is important after the pile was hidden and is being shown again
+    setTimeout(() => {
+      setupPileBackgroundHoverEvents();
+      debugLog("[ShowPile] Hover events re-setup after pile shown");
+    }, 50); // Small delay to ensure DOM is updated
+    
+    debugLog("Showing pile positioned for centered grid", {
+      containerWidth,
+      gridWidth,
+      gridCenterX,
+      gridLeftEdge,
+      smartLeftPadding,
+      dynamicHeight: gridHeight,
+      note: "First pod will be at grid's left edge, height adjusts to content"
+    });
+  }
+
+  // Hide the pile
+  function hidePile() {
+    debugLog("[HidePile] hidePile called", {
+      currentHeight: dynamicSizer?.style.height,
+      isGridMode
+    });
+    
+    if (!dynamicSizer) return;
+
+    dynamicSizer.style.pointerEvents = 'none';
+    dynamicSizer.style.height = '0px';
+    dynamicSizer.style.paddingBottom = '0px'; // Remove padding when hiding
+    dynamicSizer.style.paddingLeft = '0px'; // Remove left padding when hiding
+    
+    // Hide background and buttons when hiding pile
+    hidePileBackground();
+    
+    if (isGridMode) {
+      transitionToPile(); // Transition back to pile state if in grid
+    }
+    
+    debugLog("Hiding dismissed downloads pile by collapsing sizer");
+  }
+
+  // Transition from pile to grid
+  function transitionToGrid() {
+    if (isGridMode) return;
+    
+    isGridMode = true;
+    debugLog("Transitioning to grid mode");
+    
+    // Update hover events for grid mode
+    setupPileBackgroundHoverEvents();
+    
+    // Update pointer events for grid mode
+    updatePointerEvents();
+
+    // No need to change justify-content - positioning handled by padding
+
+    // Get only the last 6 pods (most recent)
+    const allPods = Array.from(dismissedPods.keys());
+    const lastSixPods = allPods.slice(-6); // Get the last 6 pods
+    
+    debugLog(`Showing ${lastSixPods.length} of ${allPods.length} pods in grid`, lastSixPods);
+
+    // First, normalize z-index for all visible pods to prevent flickering during animation
+    lastSixPods.forEach(podKey => {
+      const podElement = podElements.get(podKey);
+      if (podElement) {
+        podElement.style.zIndex = 10; // Set consistent z-index before animation
+      }
+    });
+
+    // Show only the last 6 pods, hide the rest
+    dismissedPods.forEach((_, podKey) => {
+      const podElement = podElements.get(podKey);
+      if (!podElement) return;
+      
+      if (lastSixPods.includes(podKey)) {
+        // This pod should be shown in the grid
+        podElement.style.display = 'block';
+      } else {
+        // This pod should be hidden in grid mode
+        podElement.style.display = 'none';
+      }
+    });
+
+    // Regenerate grid positions for only the last 6 pods using anchor-based approach
+    lastSixPods.forEach((podKey, index) => {
+      const cols = 3;
+      const maxRows = 2;
+      
+      const col = index % cols;
+      const logicalRow = Math.floor(index / cols);
+      const visualRow = logicalRow % maxRows;
+      
+      const podSize = CONFIG.minPodSize;
+      const spacing = CONFIG.gridPadding;
+      
+      // First pod (index 0) stays at anchor position (0,0)
+      // Other pods arrange relative to it
+      let x, y;
+      
+      if (index === 0) {
+        // First pod stays at anchor
+        x = 0;
+        y = 0;
+      } else {
+        // Other pods in grid pattern
+        x = col * (podSize + spacing);
+        y = -visualRow * (podSize + spacing);
+      }
+
+      gridPositions.set(podKey, { x, y, row: logicalRow, col });
+    });
+
+    // Animate pods to grid positions with staggered timing
+    let delay = 0;
+    lastSixPods.forEach(podKey => {
+      applyGridPosition(podKey, delay);
+      delay += CONFIG.gridAnimationDelay;
+    });
+  }
+
+  // Transition from grid to pile
+  function transitionToPile() {
+    if (!isGridMode) return;
+    
+    isGridMode = false;
+    debugLog("Transitioning to pile mode");
+    
+    // Update hover events for pile mode
+    setupPileBackgroundHoverEvents();
+    
+    // Update pointer events for pile mode
+    updatePointerEvents();
+
+    // No need to change justify-content - positioning handled by padding
+
+    // Animate pods back to pile positions
+    dismissedPods.forEach((_, podKey) => {
+      applyPilePosition(podKey, true);
+    });
+
+    // Hide excess pods after animation
+    setTimeout(() => {
+      updatePileVisibility();
+    }, CONFIG.animationDuration);
+  }
+
+  // Recalculate layout on window resize
+  function recalculateLayout() {
+    if (dismissedPods.size === 0) return;
+
+    // Regenerate grid positions
+    dismissedPods.forEach((_, podKey) => {
+      generateGridPosition(podKey);
+    });
+
+    // Recalculate fixed position if pile is currently shown
+    if (dynamicSizer && dynamicSizer.style.height !== '0px') {
+      const navigatorToolbox = document.getElementById('navigator-toolbox');
+      if (navigatorToolbox) {
+        const rect = navigatorToolbox.getBoundingClientRect();
+        const isRightSide = document.documentElement.getAttribute('zen-right-side') === 'true';
+        
+        if (isRightSide) {
+          const containerWidth = parseFloat(currentZenSidebarWidthForPile) || 300;
+          dynamicSizer.style.left = `${rect.right - containerWidth}px`;
+        } else {
+          dynamicSizer.style.left = `${rect.left}px`;
+        }
+        
+        debugLog("Recalculated pile position on resize", {
+          newLeft: dynamicSizer.style.left
+        });
+      }
+    }
+
+    // Apply current mode positions
+    if (isGridMode) {
+      dismissedPods.forEach((_, podKey) => {
+        applyGridPosition(podKey, 0);
+      });
+    }
+  }
+
+  // Utility: Debounce function
+  function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        clearTimeout(timeout);
+        func(...args);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+    };
+  }
+
+  // --- Pile Container Width Synchronization Logic ---
+  function updatePileContainerWidth() {
+    if (!dynamicSizer) {
+      debugLog('[PileWidthSync] dynamicSizer not found. Cannot set width.');
+      return;
+    }
+
+    const navigatorToolbox = document.getElementById('navigator-toolbox');
+    let newWidth = '';
+
+    if (navigatorToolbox) {
+      const value = getComputedStyle(navigatorToolbox).getPropertyValue('--zen-sidebar-width').trim();
+      if (value && value !== "0px" && value !== "") {
+        newWidth = value;
+        debugLog('[PileWidthSync] Using --zen-sidebar-width from #navigator-toolbox:', newWidth);
+      }
+    }
+
+    if (!newWidth) {
+      const sidebarBox = document.getElementById('sidebar-box');
+      if (sidebarBox && sidebarBox.clientWidth > 0) {
+        newWidth = `${sidebarBox.clientWidth}px`;
+        debugLog('[PileWidthSync] Using #sidebar-box.clientWidth as fallback:', newWidth);
+      } else {
+        newWidth = '300px'; // Last resort default
+        debugLog('[PileWidthSync] Using default width (300px) as final fallback.');
+      }
+    }
+
+    // Update the global variable and set the width (not max-width since we're fixed positioned)
+    currentZenSidebarWidthForPile = newWidth;
+    
+    // Subtract 5px to prevent protruding beyond sidebar
+    const numericWidth = parseFloat(newWidth);
+    const adjustedWidth = `${numericWidth + 5}px`;
+    dynamicSizer.style.width = adjustedWidth;
+    debugLog('[PileWidthSync] Set dynamicSizer width to:', adjustedWidth, '(original:', newWidth, ')');
+  }
+
+  function initPileSidebarWidthSync() {
+    // This function is now unused - width is only read on-demand in showPile()
+    debugLog('[PileWidthSync] initPileSidebarWidthSync called but automatic sync is disabled to prevent feedback loops.');
+  }
+  // --- End Pile Container Width Synchronization Logic ---
+
+  // Helper function to capture pod data for dismissal
+  function capturePodDataForDismissal(downloadKey) {
+    const cardData = activeDownloadCards.get(downloadKey);
+    if (!cardData || !cardData.download) {
+      debugLog(`[Dismiss] No card data found for capturing: ${downloadKey}`);
+      return null;
+    }
+    
+    const download = cardData.download;
+    const podElement = cardData.podElement;
+    
+    // Capture essential data for pile reconstruction
+    const dismissedData = {
+      key: downloadKey,
+      filename: download.aiName || cardData.originalFilename || getSafeFilename(download),
+      originalFilename: cardData.originalFilename,
+      fileSize: download.currentBytes || download.totalBytes || 0,
+      contentType: download.contentType,
+      targetPath: download.target?.path,
+      sourceUrl: download.source?.url,
+      startTime: download.startTime,
+      endTime: download.endTime,
+      dismissTime: Date.now(),
+      wasRenamed: !!download.aiName,
+      // Capture preview data
+      previewData: null,
+      dominantColor: podElement?.dataset?.dominantColor || null
+    };
+    
+    // Try to capture preview image data
+    if (podElement) {
+      const previewContainer = podElement.querySelector('.card-preview-container');
+      if (previewContainer) {
+        const img = previewContainer.querySelector('img');
+        if (img && img.src) {
+          dismissedData.previewData = {
+            type: 'image',
+            src: img.src
+          };
+        } else {
+          // Capture icon/text preview
+          dismissedData.previewData = {
+            type: 'icon',
+            html: previewContainer.innerHTML
+          };
+        }
+      }
+    }
+    
+    debugLog(`[Dismiss] Captured pod data for pile:`, dismissedData);
+    return dismissedData;
+  }
+
+  // Update downloads button visibility - now handled by hover events
+  function updateDownloadsButtonVisibility() {
+    // Buttons are now controlled by hover events in showPileBackground/hidePileBackground
+    // This function is kept for compatibility but doesn't change visibility
+    debugLog(`[DownloadsButton] Button visibility managed by hover - ${dismissedPods.size} dismissed pods`);
+  }
+
+  // Function to remove a specific download from Firefox downloads list
+  async function removeDownloadFromFirefoxList(podData) {
+    try {
+      debugLog(`[DeleteDownload] Attempting to remove download from Firefox list: ${podData.filename}`);
+      
+      // Get the downloads list
+      const list = await window.Downloads.getList(window.Downloads.ALL);
+      const downloads = await list.getAll();
+      
+      // Find the download that matches our pod data
+      let targetDownload = null;
+      
+      for (const download of downloads) {
+        // Try to match by target path (most reliable)
+        if (podData.targetPath && download.target?.path === podData.targetPath) {
+          targetDownload = download;
+          debugLog(`[DeleteDownload] Found download by target path: ${download.target.path}`);
+          break;
+        }
+        
+        // Fallback: try to match by source URL and filename
+        if (podData.sourceUrl && download.source?.url === podData.sourceUrl) {
+          // Additional check for filename if available
+          const downloadFilename = download.target?.path ? 
+            download.target.path.split(/[/\\]/).pop() : null;
+          
+          if (!downloadFilename || downloadFilename === podData.filename || 
+              downloadFilename === podData.originalFilename) {
+            targetDownload = download;
+            debugLog(`[DeleteDownload] Found download by source URL: ${download.source.url}`);
+            break;
+          }
+        }
+      }
+      
+      if (targetDownload) {
+        // Remove the download from Firefox's list
+        await list.remove(targetDownload);
+        debugLog(`[DeleteDownload] Successfully removed download from Firefox list: ${podData.filename}`);
+        return true;
+      } else {
+        debugLog(`[DeleteDownload] Download not found in Firefox list: ${podData.filename}`);
+        return false;
+      }
+      
+    } catch (error) {
+      debugLog(`[DeleteDownload] Error removing download from Firefox list:`, error);
+      throw error;
+    }
+  }
+
+  // Function to clear all downloads from Firefox
+  async function clearAllDownloads() {
+    try {
+      debugLog("[ClearAll] Starting to clear all downloads from Firefox");
+      
+      // Get the downloads list
+      const list = await window.Downloads.getList(window.Downloads.ALL);
+      const downloads = await list.getAll();
+      
+      debugLog(`[ClearAll] Found ${downloads.length} downloads to clear`);
+      
+      // Remove all downloads from the list
+      for (const download of downloads) {
+        try {
+          await list.remove(download);
+          debugLog(`[ClearAll] Removed download: ${download.target?.path || download.source?.url}`);
+        } catch (error) {
+          debugLog(`[ClearAll] Error removing individual download:`, error);
+        }
+      }
+      
+      // Clear the dismissed pile as well since all downloads are gone
+      dismissedPods.clear();
+      updatePileVisibility();
+      updateDownloadsButtonVisibility();
+      
+      debugLog("[ClearAll] Successfully cleared all downloads and pile");
+      
+    } catch (error) {
+      debugLog("[ClearAll] Error clearing downloads:", error);
+      throw error;
+    }
+  }
+
+  // Check if main download script has active pods to disable hover
+  function shouldDisableHover() {
+    try {
+      // Check if main download script is available and has active cards
+      if (window.zenTidyDownloads?.activeDownloadCards?.size > 0) {
+        debugLog(`[HoverCheck] Main script has ${window.zenTidyDownloads.activeDownloadCards.size} active pods - disabling pile hover`);
+        return true;
+      }
+      
+      // Alternative check: look for visible download pods in the DOM
+      const mainContainer = document.getElementById('userchrome-download-cards-container');
+      if (mainContainer && mainContainer.style.display !== 'none' && mainContainer.style.opacity !== '0') {
+        const visiblePods = mainContainer.querySelectorAll('.download-pod:not([style*="opacity: 0"])');
+        if (visiblePods.length > 0) {
+          debugLog(`[HoverCheck] Found ${visiblePods.length} visible pods in main container - disabling pile hover`);
+          return true;
+        }
+      }
+      
+      return false;
+    } catch (error) {
+      debugLog(`[HoverCheck] Error checking main script state:`, error);
+      return false;
+    }
+  }
+
+  // Show pile background and buttons on hover
+  function showPileBackground() {
+    if (!dynamicSizer) {
+      debugLog("[PileHover] showPileBackground: dynamicSizer not found");
+      return;
+    }
+    
+    debugLog("[PileHover] showPileBackground called");
+    
+    // Show background
+    dynamicSizer.style.background = 'color-mix(in srgb, var(--zen-primary-color) 10%, transparent)';
+    
+    // Show button container and buttons (but only make them clickable in grid mode)
+    const buttonContainer = document.getElementById("zen-pile-button-container");
+    const downloadsButton = document.getElementById("zen-pile-downloads-button");
+    const clearAllButton = document.getElementById("zen-pile-clear-all-button");
+    
+    debugLog("[PileHover] Found elements:", { 
+      buttonContainer: !!buttonContainer,
+      downloadsButton: !!downloadsButton, 
+      clearAllButton: !!clearAllButton 
+    });
+    
+    if (downloadsButton) {
+      downloadsButton.style.opacity = '1';
+      debugLog("[PileHover] Downloads button shown");
+    }
+    if (clearAllButton) {
+      clearAllButton.style.opacity = '1';
+      debugLog("[PileHover] Clear all button shown");
+    }
+    
+    // Update pointer events based on current mode (this will handle button clickability)
+    updatePointerEvents();
+    
+    debugLog("[PileHover] Showing pile background and buttons");
+  }
+
+  // Hide pile background and buttons when not hovering
+  function hidePileBackground() {
+    if (!dynamicSizer) {
+      debugLog("[PileHover] hidePileBackground: dynamicSizer not found");
+      return;
+    }
+    
+    // Don't hide during transitions
+    if (isTransitioning) {
+      debugLog("[PileHover] hidePileBackground blocked - transition in progress");
+      return;
+    }
+    
+    debugLog("[PileHover] hidePileBackground called");
+    
+    // Hide background
+    dynamicSizer.style.background = 'transparent';
+    
+    // Hide button container and buttons
+    const buttonContainer = document.getElementById("zen-pile-button-container");
+    const downloadsButton = document.getElementById("zen-pile-downloads-button");
+    const clearAllButton = document.getElementById("zen-pile-clear-all-button");
+    
+    if (downloadsButton) {
+      downloadsButton.style.opacity = '0';
+      debugLog("[PileHover] Downloads button hidden");
+    }
+    if (clearAllButton) {
+      clearAllButton.style.opacity = '0';
+      debugLog("[PileHover] Clear all button hidden");
+    }
+    
+    // Update pointer events based on current mode (this will handle button clickability)
+    updatePointerEvents();
+    
+    debugLog("[PileHover] Hiding pile background and buttons");
+  }
+
+  // Setup hover events for background/buttons based on current mode
+  function setupPileBackgroundHoverEvents() {
+    if (!dynamicSizer || !pileContainer) {
+      debugLog("[PileHover] setupPileBackgroundHoverEvents: Missing elements", {
+        dynamicSizer: !!dynamicSizer,
+        pileContainer: !!pileContainer
+      });
+      return;
+    }
+    
+    debugLog("[PileHover] setupPileBackgroundHoverEvents called", {
+      isGridMode,
+      containerHoverEventsAttached,
+      pileHoverEventsAttached
+    });
+    
+    // Set transition flag to prevent hiding during event switching
+    isTransitioning = true;
+    
+    // Remove existing hover events first
+    if (containerHoverEventsAttached) {
+      dynamicSizer.removeEventListener('mouseenter', showPileBackground);
+      dynamicSizer.removeEventListener('mouseleave', hidePileBackground);
+      containerHoverEventsAttached = false;
+      debugLog("[PileHover] Removed container hover events");
+    }
+    
+    if (pileHoverEventsAttached) {
+      pileContainer.removeEventListener('mouseenter', showPileBackground);
+      pileContainer.removeEventListener('mouseleave', hidePileBackground);
+      pileHoverEventsAttached = false;
+      debugLog("[PileHover] Removed pile hover events");
+    }
+    
+    // Add appropriate hover events based on mode
+    if (isGridMode) {
+      // In grid mode: hover over entire container shows background/buttons
+      dynamicSizer.addEventListener('mouseenter', showPileBackground);
+      dynamicSizer.addEventListener('mouseleave', hidePileBackground);
+      containerHoverEventsAttached = true;
+      debugLog("[PileHover] Grid mode: Added hover events to container");
+    } else {
+      // In pile mode: only hover over actual pile shows background/buttons
+      pileContainer.addEventListener('mouseenter', showPileBackground);
+      pileContainer.addEventListener('mouseleave', hidePileBackground);
+      pileHoverEventsAttached = true;
+      debugLog("[PileHover] Pile mode: Added hover events to pile only");
+    }
+    
+    // Clear transition flag after a brief delay to allow events to settle
+    setTimeout(() => {
+      isTransitioning = false;
+      debugLog("[PileHover] Transition flag cleared - hover events stable");
+    }, 100);
+  }
+
+  // Alt key handlers for always-show mode
+  function handleKeyDown(event) {
+    if (event.key === 'Alt' && !isAltPressed) {
+      isAltPressed = true;
+      debugLog("[AlwaysShow] Alt key pressed");
+      
+      if (getAlwaysShowPile() && dismissedPods.size > 0) {
+        // Hide pile when Alt is pressed in always-show mode
+        hidePile();
+      }
+    }
+  }
+
+  function handleKeyUp(event) {
+    if (event.key === 'Alt' && isAltPressed) {
+      isAltPressed = false;
+      debugLog("[AlwaysShow] Alt key released");
+      
+      if (getAlwaysShowPile() && dismissedPods.size > 0) {
+        // Show pile again when Alt is released in always-show mode
+        showPile();
+      }
+    }
+  }
+
+  // Check if pile should be visible based on always-show mode and Alt key state
+  function shouldPileBeVisible() {
+    if (dismissedPods.size === 0) return false;
+    
+    if (getAlwaysShowPile()) {
+      // In always-show mode: visible unless Alt is pressed
+      return !isAltPressed;
+    } else {
+      // Normal hover mode: only visible when hovering
+      return false; // This will be overridden by hover handlers
+    }
+  }
+
+  // Get preference values with defaults
+  function getAlwaysShowPile() {
+    try {
+      return Services.prefs.getBoolPref(PREFS.alwaysShowPile, false);
+    } catch (e) {
+      debugLog("Error reading always-show-pile preference, using default (false):", e);
+      return false;
+    }
+  }
+
+  // Setup preference change listener
+  function setupPreferenceListener() {
+    try {
+      const prefObserver = {
+        observe: function(subject, topic, data) {
+          if (topic === 'nsPref:changed' && data === PREFS.alwaysShowPile) {
+            const newValue = getAlwaysShowPile();
+            debugLog(`[Preferences] Always-show-pile preference changed to: ${newValue}`);
+            handleAlwaysShowPileChange(newValue);
+          }
+        }
+      };
+
+      Services.prefs.addObserver(PREFS.alwaysShowPile, prefObserver, false);
+      debugLog("[Preferences] Added observer for always-show-pile preference");
+
+      // Store observer for cleanup
+      window.zenDismissedPilePrefsObserver = prefObserver;
+    } catch (e) {
+      debugLog("[Preferences] Error setting up preference observer:", e);
+    }
+  }
+
+  // Handle preference change
+  function handleAlwaysShowPileChange(newValue) {
+    debugLog(`[Preferences] Handling always-show-pile change to: ${newValue}`);
+    
+    if (dismissedPods.size === 0) {
+      debugLog("[Preferences] No dismissed pods, nothing to do");
+      return;
+    }
+
+    if (newValue) {
+      // Switched to always-show mode
+      if (shouldPileBeVisible()) {
+        showPile();
+        debugLog("[Preferences] Switched to always-show mode - showing pile");
+      }
+    } else {
+      // Switched to hover mode
+      if (dynamicSizer && dynamicSizer.style.height !== '0px') {
+        // If pile is currently visible, hide it (it will show again on hover)
+        hidePile();
+        debugLog("[Preferences] Switched to hover mode - hiding pile");
+      }
+    }
+  }
+
+  // Update pointer-events based on current state and mode
+  function updatePointerEvents() {
+    if (!dynamicSizer || !pileContainer) return;
+    
+    const alwaysShow = getAlwaysShowPile();
+    const backgroundVisible = dynamicSizer.style.background !== 'transparent';
+    const buttonContainer = document.getElementById("zen-pile-button-container");
+    const downloadsButton = document.getElementById("zen-pile-downloads-button");
+    const clearAllButton = document.getElementById("zen-pile-clear-all-button");
+    
+    // Buttons should only be clickable in grid mode
+    if (isGridMode) {
+      // Grid mode: enable button interactions
+      if (buttonContainer) buttonContainer.style.pointerEvents = 'auto';
+      if (downloadsButton) downloadsButton.style.pointerEvents = 'auto';
+      if (clearAllButton) clearAllButton.style.pointerEvents = 'auto';
+      dynamicSizer.style.pointerEvents = 'auto';
+      pileContainer.style.pointerEvents = 'auto';
+      debugLog("[PointerEvents] Grid mode: All interactions enabled");
+    } else {
+      // Pile mode: disable button interactions
+      if (buttonContainer) buttonContainer.style.pointerEvents = 'none';
+      if (downloadsButton) downloadsButton.style.pointerEvents = 'none';
+      if (clearAllButton) clearAllButton.style.pointerEvents = 'none';
+      
+      // Handle container pointer events based on always-show mode and background visibility
+      if (alwaysShow && !backgroundVisible) {
+        // Always-show mode, pile mode, no background: disable container events but allow pile interaction
+        dynamicSizer.style.pointerEvents = 'none';
+        pileContainer.style.pointerEvents = 'auto';
+        debugLog("[PointerEvents] Always-show pile mode: Container disabled, pile enabled, buttons disabled");
+      } else {
+        // Normal hover mode or background visible: enable all container events
+        dynamicSizer.style.pointerEvents = 'auto';
+        pileContainer.style.pointerEvents = 'auto';
+        debugLog("[PointerEvents] Pile mode with background or normal hover: Container enabled, buttons disabled");
+      }
+    }
+  }
+
+  // Show context menu at position
+  function showContextMenu(x, y, podData) {
+    // Always create a fresh context menu to avoid event handler issues
+    hideContextMenu(); // Hide any existing menu first
+    
+    // Remove any existing menu from DOM
+    const existingMenu = document.getElementById('zen-pile-context-menu');
+    if (existingMenu) {
+      existingMenu.remove();
+    }
+    
+    // Create fresh context menu
+    const contextMenu = document.createElement('div');
+    contextMenu.id = 'zen-pile-context-menu';
+    contextMenu.style.cssText = `
+      position: fixed;
+      background: var(--zen-primary-color);
+      border: 1px solid var(--panel-border-color);
+      border-radius: 6px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      padding: 4px 0;
+      min-width: 120px;
+      z-index: 10000;
+      display: none;
+      font-size: 13px;
+      color: inherit;
+    `;
+
+    // Create open item
+    const openItem = document.createElement('div');
+    openItem.className = 'context-menu-item';
+    openItem.textContent = 'Open';
+    openItem.style.cssText = `
+      padding: 8px 16px;
+      cursor: pointer;
+      transition: background-color 0.1s;
+    `;
+    
+    // Add hover effects for open item
+    openItem.addEventListener('mouseenter', () => {
+      openItem.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+    });
+    openItem.addEventListener('mouseleave', () => {
+      openItem.style.backgroundColor = 'transparent';
+    });
+    
+    // Add click handler for open item
+    openItem.addEventListener('click', () => {
+      debugLog(`[ContextMenu] Opening file: ${podData.key}`);
+      openPodFile(podData);
+      hideContextMenu();
+    });
+
+    // Create rename item
+    const renameItem = document.createElement('div');
+    renameItem.className = 'context-menu-item';
+    renameItem.textContent = 'Rename';
+    renameItem.style.cssText = `
+      padding: 8px 16px;
+      cursor: pointer;
+      transition: background-color 0.1s;
+    `;
+    
+    // Add hover effects for rename item
+    renameItem.addEventListener('mouseenter', () => {
+      renameItem.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+    });
+    renameItem.addEventListener('mouseleave', () => {
+      renameItem.style.backgroundColor = 'transparent';
+    });
+    
+    // Add click handler for rename item
+    renameItem.addEventListener('click', () => {
+      debugLog(`[ContextMenu] Rename clicked for: ${podData.key}`);
+      showRenameDialog(podData);
+      hideContextMenu();
+    });
+
+    // Create delete item
+    const deleteItem = document.createElement('div');
+    deleteItem.className = 'context-menu-item';
+    deleteItem.textContent = 'Delete';
+    deleteItem.style.cssText = `
+      padding: 8px 16px;
+      cursor: pointer;
+      transition: background-color 0.1s;
+      color: var(--red-50);
+    `;
+    
+    // Add hover effects for delete item
+    deleteItem.addEventListener('mouseenter', () => {
+      deleteItem.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+    });
+    deleteItem.addEventListener('mouseleave', () => {
+      deleteItem.style.backgroundColor = 'transparent';
+    });
+    
+    // Add click handler for delete item
+    deleteItem.addEventListener('click', async () => {
+      debugLog(`[ContextMenu] Delete clicked for single pod: ${podData.key}`);
+      
+      if (confirm(`Permanently delete "${podData.filename}" from pile and Firefox downloads?`)) {
+        try {
+          debugLog(`[ContextMenu] User confirmed deletion of: ${podData.filename}`);
+          
+          // First, remove from Firefox downloads list
+          await removeDownloadFromFirefoxList(podData);
+          
+          // Then remove from pile and main script
+          window.zenTidyDownloads.permanentDelete(podData.key);
+          removePodFromPile(podData.key);
+          
+          debugLog(`[ContextMenu] Successfully deleted pod and download: ${podData.filename}`);
+        } catch (error) {
+          debugLog(`[ContextMenu] Error deleting pod/download: ${podData.filename}`, error);
+          // Still try to remove from pile even if Firefox removal fails
+          window.zenTidyDownloads.permanentDelete(podData.key);
+          removePodFromPile(podData.key);
+        }
+      } else {
+        debugLog(`[ContextMenu] User cancelled deletion of: ${podData.filename}`);
+      }
+      
+      hideContextMenu();
+    });
+
+    // Add items to menu
+    contextMenu.appendChild(openItem);
+    contextMenu.appendChild(renameItem);
+    contextMenu.appendChild(deleteItem);
+    document.body.appendChild(contextMenu);
+
+    // Position and show menu - open upward from bottom-left
+    // First show menu temporarily to get its dimensions
+    contextMenu.style.visibility = 'hidden';
+    contextMenu.style.display = 'block';
+    const menuRect = contextMenu.getBoundingClientRect();
+    contextMenu.style.visibility = 'visible';
+    
+    // Position with bottom-left at cursor position (menu grows upward)
+    const menuX = x;
+    const menuY = y - menuRect.height;
+    
+    contextMenu.style.left = `${menuX}px`;
+    contextMenu.style.top = `${menuY}px`;
+
+    // Store reference for hiding
+    window.zenPileContextMenu = { contextMenu };
+
+    debugLog(`[ContextMenu] Created fresh menu for single pod: ${podData.filename} at (${menuX}, ${menuY})`);
+  }
+
+  // Check if context menu is currently visible
+  function isContextMenuVisible() {
+    const existingMenu = document.getElementById('zen-pile-context-menu');
+    const existingDialog = document.getElementById('zen-pile-rename-dialog');
+    return existingMenu !== null || existingDialog !== null;
+  }
+
+  // Hide context menu
+  function hideContextMenu() {
+    // Remove the context menu from DOM
+    const existingMenu = document.getElementById('zen-pile-context-menu');
+    if (existingMenu) {
+      existingMenu.remove();
+      debugLog("[ContextMenu] Context menu removed from DOM");
+    }
+    
+    // Clear the reference
+    if (window.zenPileContextMenu) {
+      window.zenPileContextMenu = null;
+    }
+    
+    // After hiding menu, check if we should hide pile/transition modes
+    // Give a small delay to allow cursor position to stabilize
+    setTimeout(() => {
+      const isHoveringPile = pileContainer.matches(':hover');
+      const isHoveringSizer = dynamicSizer.matches(':hover');
+      const mainDownloadContainer = document.getElementById('userchrome-download-cards-container');
+      const isHoveringDownloadArea = downloadButton?.matches(':hover') || mainDownloadContainer?.matches(':hover');
+      
+      debugLog("[ContextMenu] Post-hide check", {
+        isHoveringPile,
+        isHoveringSizer,
+        isHoveringDownloadArea,
+        isGridMode,
+        alwaysShowMode: getAlwaysShowPile()
+      });
+      
+      // If not hovering any pile-related elements, trigger appropriate behavior
+      if (!isHoveringPile && !isHoveringSizer && !isHoveringDownloadArea) {
+        if (isGridMode) {
+          // Transition back to pile mode
+          transitionToPile();
+        }
+        
+        // If in normal hover mode (not always-show), hide the pile
+        if (!getAlwaysShowPile()) {
+          hidePile();
+        }
+      }
+    }, 100);
+  }
+
+  // Open pod file (extracted from existing click handler)
+  function openPodFile(podData) {
+    debugLog(`Attempting to open file in explorer: ${podData.key}`);
+    if (podData.targetPath) {
+      try {
+        const file = Components.classes["@mozilla.org/file/local;1"].createInstance(Components.interfaces.nsIFile);
+        file.initWithPath(podData.targetPath);
+        
+        if (file.exists()) {
+          // Open file with default application
+          file.launch();
+          debugLog(`Successfully opened file: ${podData.filename}`);
+        } else {
+          // File doesn't exist, try to open the containing folder
+          const parentDir = file.parent;
+          if (parentDir && parentDir.exists()) {
+            parentDir.launch();
+            debugLog(`File not found, opened containing folder: ${podData.filename}`);
+          } else {
+            debugLog(`File and folder not found: ${podData.filename}`);
+          }
+        }
+      } catch (error) {
+        debugLog(`Error opening file in explorer: ${podData.filename}`, error);
+      }
+    } else {
+      debugLog(`No file path available for: ${podData.filename}`);
+    }
+  }
+
+  // Show pod file in file explorer
+  function showPodFileInExplorer(podData) {
+    debugLog(`Attempting to show file in file explorer: ${podData.key}`);
+    if (podData.targetPath) {
+      try {
+        const file = Components.classes["@mozilla.org/file/local;1"].createInstance(Components.interfaces.nsIFile);
+        file.initWithPath(podData.targetPath);
+        
+        if (file.exists()) {
+          // Show file in explorer/finder
+          try {
+            // Try to reveal the file in the file manager
+            file.reveal();
+            debugLog(`Successfully showed file in explorer: ${podData.filename}`);
+          } catch (revealError) {
+            // If reveal() doesn't work, fall back to opening the containing folder
+            debugLog(`Reveal failed, trying to open containing folder: ${revealError}`);
+            const parentDir = file.parent;
+            if (parentDir && parentDir.exists()) {
+              parentDir.launch();
+              debugLog(`Opened containing folder: ${podData.filename}`);
+            } else {
+              debugLog(`Containing folder not found: ${podData.filename}`);
+            }
+          }
+        } else {
+          // File doesn't exist, try to open the containing folder
+          const parentDir = file.parent;
+          if (parentDir && parentDir.exists()) {
+            parentDir.launch();
+            debugLog(`File not found, opened containing folder: ${podData.filename}`);
+          } else {
+            debugLog(`File and folder not found: ${podData.filename}`);
+          }
+        }
+      } catch (error) {
+        debugLog(`Error showing file in explorer: ${podData.filename}`, error);
+      }
+    } else {
+      debugLog(`No file path available for: ${podData.filename}`);
+    }
+  }
+
+  // Show rename dialog
+  function showRenameDialog(podData) {
+    debugLog(`[Rename] Showing rename dialog for: ${podData.filename}`);
+    
+    // Remove any existing rename dialog
+    const existingDialog = document.getElementById('zen-pile-rename-dialog');
+    if (existingDialog) {
+      existingDialog.remove();
+    }
+    
+    // Create dialog overlay
+    const overlay = document.createElement('div');
+    overlay.id = 'zen-pile-rename-dialog';
+    overlay.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.5);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10001;
+      backdrop-filter: blur(2px);
+    `;
+    
+    // Create dialog box
+    const dialog = document.createElement('div');
+    dialog.style.cssText = `
+      background: var(--zen-primary-color);
+      border: 1px solid var(--panel-border-color);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      padding: 20px;
+      width: 400px;
+      max-width: 90vw;
+      color: inherit;
+    `;
+    
+    // Create title
+    const title = document.createElement('h3');
+    title.textContent = 'Rename File';
+    title.style.cssText = `
+      margin: 0 0 15px 0;
+      font-size: 16px;
+      font-weight: 600;
+    `;
+    
+    // Create current filename display
+    const currentName = document.createElement('div');
+    currentName.textContent = `Current: ${podData.filename}`;
+    currentName.style.cssText = `
+      margin-bottom: 10px;
+      font-size: 13px;
+      color: var(--text-color-deemphasized);
+      word-break: break-all;
+    `;
+    
+    // Create input field
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = podData.filename;
+    input.style.cssText = `
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid var(--panel-border-color);
+      border-radius: 4px;
+      background: var(--toolbar-field-background-color);
+      color: var(--toolbar-field-color);
+      font-size: 14px;
+      margin-bottom: 15px;
+      box-sizing: border-box;
+    `;
+    
+    // Select filename without extension
+    const lastDotIndex = podData.filename.lastIndexOf('.');
+    if (lastDotIndex > 0) {
+      setTimeout(() => {
+        input.setSelectionRange(0, lastDotIndex);
+        input.focus();
+      }, 100);
+    } else {
+      setTimeout(() => {
+        input.select();
+        input.focus();
+      }, 100);
+    }
+    
+    // Create button container
+    const buttonContainer = document.createElement('div');
+    buttonContainer.style.cssText = `
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+    `;
+    
+    // Create cancel button
+    const cancelButton = document.createElement('button');
+    cancelButton.textContent = 'Cancel';
+    cancelButton.style.cssText = `
+      padding: 8px 16px;
+      border: 1px solid var(--panel-border-color);
+      border-radius: 4px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 13px;
+    `;
+    
+    cancelButton.addEventListener('mouseenter', () => {
+      cancelButton.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+    });
+    cancelButton.addEventListener('mouseleave', () => {
+      cancelButton.style.backgroundColor = 'transparent';
+    });
+    
+    // Create rename button
+    const renameButton = document.createElement('button');
+    renameButton.textContent = 'Rename';
+    renameButton.style.cssText = `
+      padding: 8px 16px;
+      border: 1px solid var(--zen-primary-color);
+      border-radius: 4px;
+      background: var(--zen-primary-color);
+      color: white;
+      cursor: pointer;
+      font-size: 13px;
+    `;
+    
+    renameButton.addEventListener('mouseenter', () => {
+      renameButton.style.opacity = '0.8';
+    });
+    renameButton.addEventListener('mouseleave', () => {
+      renameButton.style.opacity = '1';
+    });
+    
+    // Handle cancel
+    const closeDialog = () => {
+      overlay.remove();
+    };
+    
+    cancelButton.addEventListener('click', closeDialog);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) {
+        closeDialog();
+      }
+    });
+    
+    // Handle rename
+    const handleRename = async () => {
+      const newName = input.value.trim();
+      
+      if (!newName) {
+        alert('Please enter a valid filename.');
+        input.focus();
+        return;
+      }
+      
+      if (newName === podData.filename) {
+        closeDialog();
+        return;
+      }
+      
+      try {
+        debugLog(`[Rename] Attempting to rename ${podData.filename} to ${newName}`);
+        await renamePodFile(podData, newName);
+        closeDialog();
+      } catch (error) {
+        debugLog(`[Rename] Error renaming file:`, error);
+        alert(`Error renaming file: ${error.message}`);
+      }
+    };
+    
+    renameButton.addEventListener('click', handleRename);
+    
+    // Handle Enter key
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleRename();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeDialog();
+      }
+    });
+    
+    // Assemble dialog
+    buttonContainer.appendChild(cancelButton);
+    buttonContainer.appendChild(renameButton);
+    
+    dialog.appendChild(title);
+    dialog.appendChild(currentName);
+    dialog.appendChild(input);
+    dialog.appendChild(buttonContainer);
+    
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    
+    debugLog(`[Rename] Rename dialog created for: ${podData.filename}`);
+  }
+
+  // Rename pod file
+  async function renamePodFile(podData, newFilename) {
+    debugLog(`[Rename] Starting rename process: ${podData.filename} -> ${newFilename}`);
+    
+    if (!podData.targetPath) {
+      throw new Error('No file path available for renaming');
+    }
+    
+    try {
+      // Get the file object
+      const file = Components.classes["@mozilla.org/file/local;1"].createInstance(Components.interfaces.nsIFile);
+      file.initWithPath(podData.targetPath);
+      
+      if (!file.exists()) {
+        throw new Error('File does not exist');
+      }
+      
+      // Get parent directory and construct new path
+      const parentDir = file.parent;
+      const newFile = parentDir.clone();
+      newFile.append(newFilename);
+      
+      // Check if target filename already exists
+      if (newFile.exists()) {
+        throw new Error('A file with this name already exists');
+      }
+      
+      // Rename the file
+      file.moveTo(parentDir, newFilename);
+      
+      // Update pod data
+      const oldFilename = podData.filename;
+      const newPath = newFile.path;
+      
+      podData.filename = newFilename;
+      podData.targetPath = newPath;
+      
+      // Update the pod in our local storage
+      dismissedPods.set(podData.key, podData);
+      
+      // Update the pod element
+      const podElement = podElements.get(podData.key);
+      if (podElement) {
+        podElement.title = `${newFilename}\nClick: Open file\nMousewheel click: Show in file explorer\nRight-click: Context menu`;
+      }
+      
+      // Try to update the main script's dismissed pods if the API exists
+      if (window.zenTidyDownloads && window.zenTidyDownloads.dismissedPods) {
+        try {
+          const mainScriptPod = window.zenTidyDownloads.dismissedPods.get(podData.key);
+          if (mainScriptPod) {
+            mainScriptPod.filename = newFilename;
+            mainScriptPod.targetPath = newPath;
+            window.zenTidyDownloads.dismissedPods.set(podData.key, mainScriptPod);
+            debugLog(`[Rename] Updated main script pod data`);
+          }
+        } catch (error) {
+          debugLog(`[Rename] Could not update main script pod data:`, error);
+        }
+      }
+      
+      // Try to update Firefox downloads list
+      try {
+        const list = await window.Downloads.getList(window.Downloads.ALL);
+        const downloads = await list.getAll();
+        
+        // Find the download that matches our pod
+        const targetDownload = downloads.find(download => 
+          download.target?.path === podData.targetPath.replace(newFilename, oldFilename) ||
+          (download.source?.url === podData.sourceUrl && 
+           download.target?.path?.endsWith(oldFilename))
+        );
+        
+        if (targetDownload && targetDownload.target) {
+          // Update the target path in the download record
+          targetDownload.target.path = newPath;
+          debugLog(`[Rename] Updated Firefox download record`);
+        }
+      } catch (error) {
+        debugLog(`[Rename] Could not update Firefox download record:`, error);
+      }
+      
+      debugLog(`[Rename] Successfully renamed file: ${oldFilename} -> ${newFilename}`);
+      
+    } catch (error) {
+      debugLog(`[Rename] Error during file rename:`, error);
+      throw error;
+    }
+  }
+
+  // Initialize when DOM is ready
+  if (document.readyState === "complete") {
+    init();
+  } else {
+    window.addEventListener("load", init, { once: true });
+  }
+
+  debugLog("Dismissed downloads pile script loaded");
+
+})(); 
